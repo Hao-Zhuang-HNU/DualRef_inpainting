@@ -63,7 +63,7 @@ def main_worker(rank, opts):
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
-    parser.add_argument('--name', type=str, default='places2_continous_edgeline', help='The name of this exp')
+    parser.add_argument('--name', type=str, default='places2_continous_line', help='The name of this exp')
     parser.add_argument('--GPU_ids', type=str, default='0')
     parser.add_argument('--ckpt_path', type=str, default='./ckpt')
     parser.add_argument('--data_path', type=str, default=None, help='Indicate where is the training set')
