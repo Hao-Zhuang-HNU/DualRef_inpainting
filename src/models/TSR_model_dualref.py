@@ -142,12 +142,25 @@ class EdgeLineGPT256RelDualRef(nn.Module):
                     decay.add(fpn)
                 elif pn.endswith('weight') and isinstance(m, blacklist_weight_modules):
                     no_decay.add(fpn)
+                elif pn in {'row_rel_emb', 'col_rel_emb'}:
+                    no_decay.add(fpn)
         no_decay.update({'pos_emb', 'type_emb_global', 'type_emb_local'})
         param_dict = {pn: p for pn, p in self.named_parameters()}
+        all_params = set(param_dict.keys())
         inter_params = decay & no_decay
+        if len(inter_params) > 0:
+            logger.warning("Found params in both decay/no_decay, keeping them in no_decay: %s",
+                           sorted(inter_params))
+            decay = decay - inter_params
+        unassigned_params = all_params - decay - no_decay
+        if len(unassigned_params) > 0:
+            logger.warning("Found unassigned params in optimizer grouping, fallback to no_decay: %s",
+                           sorted(unassigned_params))
+            no_decay.update(unassigned_params)
         union_params = decay | no_decay
+        inter_params = decay & no_decay
         assert len(inter_params) == 0, f"params in both decay/no_decay: {inter_params}"
-        assert len(param_dict.keys() - union_params) == 0, f"params not separated: {param_dict.keys() - union_params}"
+        assert len(all_params - union_params) == 0, f"params not separated: {all_params - union_params}"
         optim_groups = [
             {"params": [param_dict[pn] for pn in sorted(list(decay))], "weight_decay": train_config.weight_decay},
             {"params": [param_dict[pn] for pn in sorted(list(no_decay))], "weight_decay": 0.0},
@@ -222,7 +235,7 @@ class EdgeLineGPT256RelDualRef(nn.Module):
         line = self._decode(x)
         return line
 
-    def forward(self, img_idx, line_idx, edge_targets=None, line_targets=None, masks=None,
+    def forward(self, img_idx, line_idx, line_targets=None, masks=None,
                 global_img=None, global_line=None,
                 local_img=None, local_line=None, local_mask=None):
         ref_feat = None
@@ -233,7 +246,7 @@ class EdgeLineGPT256RelDualRef(nn.Module):
                 global_img=global_img, global_line=global_line,
                 local_img=local_img, local_line=local_line, local_mask=local_mask,
             )
-        edge, line = self.forward_with_logits(img_idx, line_idx, masks=masks, ref_feat=ref_feat)
+        line = self.forward_with_logits(img_idx, line_idx, masks=masks, ref_feat=ref_feat)
         loss = 0
         if line_targets is not None:
             loss = F.binary_cross_entropy_with_logits(
