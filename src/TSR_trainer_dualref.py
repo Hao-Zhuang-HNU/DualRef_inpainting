@@ -5,6 +5,7 @@ import time
 import cv2
 import numpy as np
 import torch
+from torch.cuda.amp import GradScaler, autocast
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data.dataloader import DataLoader
 from torch.utils.data.distributed import DistributedSampler
@@ -12,8 +13,8 @@ from tqdm import tqdm
 
 try:
     from apex import amp
-except ImportError:
-    raise ImportError("Please install apex from https://www.github.com/nvidia/apex to run this example.")
+except Exception:
+    amp = None
 
 
 class EdgeAccuracy(torch.nn.Module):
@@ -111,9 +112,14 @@ class TrainerForContinuousEdgeLine:
         model, config = self.model, self.config
         raw_model = model.module if hasattr(self.model, "module") else model
         optimizer = raw_model.configure_optimizers(config)
+        use_apex_amp = self.config.AMP and (amp is not None)
+        use_torch_amp = self.config.AMP and (amp is None)
+        scaler = GradScaler() if use_torch_amp else None
 
-        if self.config.AMP:  ## use AMP
+        if use_apex_amp:  ## use Apex AMP when available
             model, optimizer = amp.initialize(model, optimizer, num_losses=1, opt_level='O1')
+        elif use_torch_amp and self.global_rank == 0:
+            self.logger.info("Apex AMP is unavailable, falling back to torch.cuda.amp.")
 
         previous_epoch = -1
         bestAverageF1 = 0
@@ -160,24 +166,37 @@ class TrainerForContinuousEdgeLine:
                     if type(items[k]) is torch.Tensor:
                         items[k] = items[k].to(self.device)
 
-                edge, line, loss = model(items['img'], items['edge'], items['line'], items['edge'], items['line'],
-                                         items['mask'],
-                                         global_img=items['g_img'], global_edge=items['g_edge'], global_line=items['g_line'],
-                                         local_img=items['l_img'], local_edge=items['l_edge'], local_line=items['l_line'],
-                                         local_mask=items['l_mask'])
+                if use_torch_amp:
+                    with autocast():
+                        line, loss = model(items['img'], items['line'], line_targets=items['line'], masks=items['mask'],
+                                           global_img=items['g_img'], global_line=items['g_line'],
+                                           local_img=items['l_img'], local_line=items['l_line'],
+                                           local_mask=items['l_mask'])
+                else:
+                    line, loss = model(items['img'], items['line'], line_targets=items['line'], masks=items['mask'],
+                                       global_img=items['g_img'], global_line=items['g_line'],
+                                       local_img=items['l_img'], local_line=items['l_line'],
+                                       local_mask=items['l_mask'])
                 loss = loss.mean()  # collapse all losses if they are scattered on multiple gpus
                 losses.append(loss.item())
                 # backprop and update the parameters
                 self.iterations += 1  # number of iterations processed this step (i.e. label is not -100)
                 model.zero_grad()
-                if self.config.AMP:
+                if use_apex_amp:
                     with amp.scale_loss(loss, optimizer, loss_id=0) as loss_scaled:
                         loss_scaled.backward()
                     torch.nn.utils.clip_grad_norm_(amp.master_params(optimizer), config.grad_norm_clip)
+                    optimizer.step()
+                elif use_torch_amp:
+                    scaler.scale(loss).backward()
+                    scaler.unscale_(optimizer)
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), config.grad_norm_clip)
+                    scaler.step(optimizer)
+                    scaler.update()
                 else:
                     loss.backward()
                     torch.nn.utils.clip_grad_norm_(model.parameters(), config.grad_norm_clip)
-                optimizer.step()
+                    optimizer.step()
                 # decay the learning rate based on our progress
                 if config.lr_decay:
                     if self.iterations < config.warmup_iterations:
@@ -199,23 +218,15 @@ class TrainerForContinuousEdgeLine:
                         f"epoch {epoch + 1} iter {it}/{self.iterations_per_epoch}: train loss {loss.item():.5f}. lr {lr:e}")
 
                 if self.iterations % 2000 == 1 and self.global_rank == 0:
-                    edge_output = edge[:4, :, :, :].squeeze(1).cpu()
-                    edge_output = torch.cat(tuple(edge_output), dim=0)
-
                     line_output = line[:4, :, :, :].squeeze(1).cpu()
                     line_output = torch.cat(tuple(line_output), dim=0)
 
-                    masked_edges = (items['edge'][:4, ...] * (1 - items['mask'][:4, ...])).squeeze(1).cpu()
-                    original_edge = items['edge'][:4, ...].squeeze(1).cpu()
                     masked_lines = (items['line'][:4, ...] * (1 - items['mask'][:4, ...])).squeeze(1).cpu()
                     original_line = items['line'][:4, ...].squeeze(1).cpu()
-                    masked_edges = torch.cat(tuple(masked_edges), dim=0)
-                    original_edge = torch.cat(tuple(original_edge), dim=0)
                     masked_lines = torch.cat(tuple(masked_lines), dim=0)
                     original_line = torch.cat(tuple(original_line), dim=0)
 
-                    output = torch.cat([original_edge.float(), original_line.float(), masked_edges.float(),
-                                        masked_lines.float(), edge_output.float(), line_output.float()],
+                    output = torch.cat([original_line.float(), masked_lines.float(), line_output.float()],
                                        dim=-1)[:, :, None].repeat(1, 1, 3)
                     output *= 255
                     output = output.detach().numpy().astype(np.uint8)
@@ -233,30 +244,27 @@ class TrainerForContinuousEdgeLine:
 
                     # eval
                     model.eval()
-                    edge_P, edge_R, edge_F1, line_P, line_R, line_F1 = self.val(model, test_loader)
+                    line_P, line_R, line_F1 = self.val(model, test_loader)
                     model.train()
 
-                    average_F1 = (edge_F1 + line_F1) / 2
+                    average_F1 = line_F1
 
-                    self.logger.info("Epoch: %d, edge_P: %f, edge_R: %f, edge_F1: %f, line_P: %f, line_R: %f, "
-                                     "line_F1: %f, ave_F1: %f time for 2k iter: %d seconds" %
-                                     (epoch, edge_P, edge_R, edge_F1, line_P, line_R, line_F1, average_F1,
+                    self.logger.info("Epoch: %d, line_P: %f, line_R: %f, line_F1: %f, ave_F1: %f time for 2k iter: %d seconds" %
+                                     (epoch, line_P, line_R, line_F1, average_F1,
                                       time.time() - epoch_start))
                     # supports early stopping based on the test loss, or just save always if no test set is provided
                     good_model = self.test_dataset is None or average_F1 >= bestAverageF1
                     if self.config.ckpt_path is not None and good_model and self.global_rank == 0:  ## Validation on the global_rank==0 process
                         bestAverageF1 = average_F1
-                        EdgeF1 = edge_F1
                         LineF1 = line_F1
                         self.logger.info("current best epoch is %d" % (epoch))
-                        self.save_checkpoint(epoch, optimizer, self.iterations, bestAverageF1, EdgeF1, LineF1,
+                        self.save_checkpoint(epoch, optimizer, self.iterations, bestAverageF1, LineF1, LineF1,
                                              save_name='best')
 
-                    self.save_checkpoint(epoch, optimizer, self.iterations, average_F1, edge_F1, line_F1,
+                    self.save_checkpoint(epoch, optimizer, self.iterations, average_F1, line_F1, line_F1,
                                          save_name='latest')
 
     def val(self, model, dataloader):
-        edge_precisions, edge_recalls, edge_f1s = [], [], []
         line_precisions, line_recalls, line_f1s = [], [], []
         for it, items in enumerate(tqdm(dataloader, disable=False)):
             # place data on the correct device
@@ -264,24 +272,18 @@ class TrainerForContinuousEdgeLine:
                 if type(items[k]) is torch.Tensor:
                     items[k] = items[k].to(self.device)
             with torch.no_grad():
-                edge, line, _ = model(items['img'], items['edge'], items['line'], masks=items['mask'],
-                                     global_img=items['g_img'], global_edge=items['g_edge'], global_line=items['g_line'],
-                                     local_img=items['l_img'], local_edge=items['l_edge'], local_line=items['l_line'],
+                line, _ = model(items['img'], items['line'], masks=items['mask'],
+                                     global_img=items['g_img'], global_line=items['g_line'],
+                                     local_img=items['l_img'], local_line=items['l_line'],
                                      local_mask=items['l_mask'])
 
-            edge_preds = edge
             line_preds = line
-            precision, recall, f1 = self.metric(items['edge'] * items['mask'], edge_preds * items['mask'])
-            edge_precisions.append(precision.item())
-            edge_recalls.append(recall.item())
-            edge_f1s.append(f1.item())
             precision, recall, f1 = self.metric(items['line'] * items['mask'],
                                                 line_preds * items['mask'])
             line_precisions.append(precision.item())
             line_recalls.append(recall.item())
             line_f1s.append(f1.item())
-        return float(np.mean(edge_precisions)), float(np.mean(edge_recalls)), float(np.mean(edge_f1s)), \
-               float(np.mean(line_precisions)), float(np.mean(line_recalls)), float(np.mean(line_f1s))
+        return float(np.mean(line_precisions)), float(np.mean(line_recalls)), float(np.mean(line_f1s))
 
 
 class TrainerForEdgeLineFinetune(TrainerForContinuousEdgeLine):
@@ -292,9 +294,14 @@ class TrainerForEdgeLineFinetune(TrainerForContinuousEdgeLine):
         model, config = self.model, self.config
         raw_model = model.module if hasattr(self.model, "module") else model
         optimizer = raw_model.configure_optimizers(config)
+        use_apex_amp = self.config.AMP and (amp is not None)
+        use_torch_amp = self.config.AMP and (amp is None)
+        scaler = GradScaler() if use_torch_amp else None
 
-        if self.config.AMP:  # use AMP
+        if use_apex_amp:  # use Apex AMP when available
             model, optimizer = amp.initialize(model, optimizer, num_losses=1, opt_level='O1')
+        elif use_torch_amp and self.global_rank == 0:
+            self.logger.info("Apex AMP is unavailable, falling back to torch.cuda.amp.")
 
         previous_epoch = -1
         bestAverageF1 = 0
@@ -344,25 +351,38 @@ class TrainerForEdgeLineFinetune(TrainerForContinuousEdgeLine):
                     if type(items[k]) is torch.Tensor:
                         items[k] = items[k].to(self.device)
 
-                edge, line, loss = model(items['mask_img'], items['edge'], items['line'], items['edge'], items['line'],
-                                         items['erode_mask'],
-                                         global_img=items['g_img'], global_edge=items['g_edge'], global_line=items['g_line'],
-                                         local_img=items['l_img'], local_edge=items['l_edge'], local_line=items['l_line'],
-                                         local_mask=items['l_mask'])
+                if use_torch_amp:
+                    with autocast():
+                        line, loss = model(items['mask_img'], items['line'], line_targets=items['line'], masks=items['erode_mask'],
+                                           global_img=items['g_img'], global_line=items['g_line'],
+                                           local_img=items['l_img'], local_line=items['l_line'],
+                                           local_mask=items['l_mask'])
+                else:
+                    line, loss = model(items['mask_img'], items['line'], line_targets=items['line'], masks=items['erode_mask'],
+                                       global_img=items['g_img'], global_line=items['g_line'],
+                                       local_img=items['l_img'], local_line=items['l_line'],
+                                       local_mask=items['l_mask'])
                 loss = loss.mean()  # collapse all losses if they are scattered on multiple gpus
                 losses.append(loss.item())
 
                 # backprop and update the parameters
                 self.iterations += 1  # number of iterations processed this step (i.e. label is not -100)
                 model.zero_grad()
-                if self.config.AMP:
+                if use_apex_amp:
                     with amp.scale_loss(loss, optimizer, loss_id=0) as loss_scaled:
                         loss_scaled.backward()
                     torch.nn.utils.clip_grad_norm_(amp.master_params(optimizer), config.grad_norm_clip)
+                    optimizer.step()
+                elif use_torch_amp:
+                    scaler.scale(loss).backward()
+                    scaler.unscale_(optimizer)
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), config.grad_norm_clip)
+                    scaler.step(optimizer)
+                    scaler.update()
                 else:
                     loss.backward()
                     torch.nn.utils.clip_grad_norm_(model.parameters(), config.grad_norm_clip)
-                optimizer.step()
+                    optimizer.step()
                 # decay the learning rate based on our progress
                 if config.lr_decay:
                     if self.iterations < config.warmup_iterations:
@@ -384,23 +404,15 @@ class TrainerForEdgeLineFinetune(TrainerForContinuousEdgeLine):
                         f"epoch {epoch + 1} iter {it}/{self.iterations_per_epoch}: train loss {loss.item():.5f}. lr {lr:e}")
 
                 if self.iterations % 2000 == 1 and self.global_rank == 0:
-                    edge_output = edge[:4, :, :, :].squeeze(1).cpu()
-                    edge_output = torch.cat(tuple(edge_output), dim=0)
-
                     line_output = line[:4, :, :, :].squeeze(1).cpu()
                     line_output = torch.cat(tuple(line_output), dim=0)
 
-                    masked_edges = (items['edge'][:4, ...] * (1 - items['erode_mask'][:4, ...])).squeeze(1).cpu()
-                    original_edge = items['edge'][:4, ...].squeeze(1).cpu()
                     masked_lines = (items['line'][:4, ...] * (1 - items['erode_mask'][:4, ...])).squeeze(1).cpu()
                     original_line = items['line'][:4, ...].squeeze(1).cpu()
-                    masked_edges = torch.cat(tuple(masked_edges), dim=0)
-                    original_edge = torch.cat(tuple(original_edge), dim=0)
                     masked_lines = torch.cat(tuple(masked_lines), dim=0)
                     original_line = torch.cat(tuple(original_line), dim=0)
 
-                    output = torch.cat([original_edge.float(), original_line.float(), masked_edges.float(),
-                                        masked_lines.float(), edge_output.float(), line_output.float()],
+                    output = torch.cat([original_line.float(), masked_lines.float(), line_output.float()],
                                        dim=-1)[:, :, None].repeat(1, 1, 3)
                     output *= 255
                     output = output.detach().numpy().astype(np.uint8)
@@ -418,30 +430,27 @@ class TrainerForEdgeLineFinetune(TrainerForContinuousEdgeLine):
 
                     # eval
                     model.eval()
-                    edge_P, edge_R, edge_F1, line_P, line_R, line_F1 = self.val(model, test_loader)
+                    line_P, line_R, line_F1 = self.val(model, test_loader)
                     model.train()
 
-                    average_F1 = (edge_F1 + line_F1) / 2
+                    average_F1 = line_F1
 
-                    self.logger.info("Epoch: %d, edge_P: %f, edge_R: %f, edge_F1: %f, line_P: %f, line_R: %f, "
-                                     "line_F1: %f, ave_F1: %f time for 2k iter: %d seconds" %
-                                     (epoch, edge_P, edge_R, edge_F1, line_P, line_R, line_F1, average_F1,
+                    self.logger.info("Epoch: %d, line_P: %f, line_R: %f, line_F1: %f, ave_F1: %f time for 2k iter: %d seconds" %
+                                     (epoch, line_P, line_R, line_F1, average_F1,
                                       time.time() - epoch_start))
                     # supports early stopping based on the test loss, or just save always if no test set is provided
                     good_model = self.test_dataset is None or average_F1 >= bestAverageF1
                     if self.config.ckpt_path is not None and good_model and self.global_rank == 0:  ## Validation on the global_rank==0 process
                         bestAverageF1 = average_F1
-                        EdgeF1 = edge_F1
                         LineF1 = line_F1
                         self.logger.info("current best epoch is %d" % (epoch))
-                        self.save_checkpoint(epoch, optimizer, self.iterations, bestAverageF1, EdgeF1, LineF1,
+                        self.save_checkpoint(epoch, optimizer, self.iterations, bestAverageF1, LineF1, LineF1,
                                              save_name='best')
 
-                    self.save_checkpoint(epoch, optimizer, self.iterations, average_F1, edge_F1, line_F1,
+                    self.save_checkpoint(epoch, optimizer, self.iterations, average_F1, line_F1, line_F1,
                                          save_name='latest')
 
     def val(self, model, dataloader):
-        edge_precisions, edge_recalls, edge_f1s = [], [], []
         line_precisions, line_recalls, line_f1s = [], [], []
         for it, items in enumerate(tqdm(dataloader, disable=False)):
             # place data on the correct device
@@ -449,20 +458,14 @@ class TrainerForEdgeLineFinetune(TrainerForContinuousEdgeLine):
                 if type(items[k]) is torch.Tensor:
                     items[k] = items[k].to(self.device)
             with torch.no_grad():
-                edge, line, _ = model(items['mask_img'], items['edge'], items['line'], masks=items['erode_mask'],
-                                     global_img=items['g_img'], global_edge=items['g_edge'], global_line=items['g_line'],
-                                     local_img=items['l_img'], local_edge=items['l_edge'], local_line=items['l_line'],
+                line, _ = model(items['mask_img'], items['line'], masks=items['erode_mask'],
+                                     global_img=items['g_img'], global_line=items['g_line'],
+                                     local_img=items['l_img'], local_line=items['l_line'],
                                      local_mask=items['l_mask'])
 
-            edge_preds = edge
             line_preds = line
-            precision, recall, f1 = self.metric(items['edge'] * items['erode_mask'], edge_preds * items['erode_mask'])
-            edge_precisions.append(precision.item())
-            edge_recalls.append(recall.item())
-            edge_f1s.append(f1.item())
             precision, recall, f1 = self.metric(items['line'] * items['erode_mask'],  line_preds * items['erode_mask'])
             line_precisions.append(precision.item())
             line_recalls.append(recall.item())
             line_f1s.append(f1.item())
-        return float(np.mean(edge_precisions)), float(np.mean(edge_recalls)), float(np.mean(edge_f1s)), \
-               float(np.mean(line_precisions)), float(np.mean(line_recalls)), float(np.mean(line_f1s))
+        return float(np.mean(line_precisions)), float(np.mean(line_recalls)), float(np.mean(line_f1s))
