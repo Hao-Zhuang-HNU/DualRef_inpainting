@@ -187,6 +187,8 @@ class EdgeLineGPT256RelDualRef(nn.Module):
             if global_img is None:
                 B, _, H, W = global_line.shape
                 global_img = torch.zeros((B, 3, H, W), device=global_line.device, dtype=global_line.dtype)
+            if global_line is None:
+                global_line = torch.zeros_like(global_img[:, :1, :, :])
             zero_mask = torch.zeros_like(global_img[:, :1, :, :])
             g_feat = self._encode(global_img, global_line, masks=zero_mask)
             g_feat = F.adaptive_avg_pool2d(g_feat, (self.config.global_pool_size, self.config.global_pool_size))
@@ -196,6 +198,8 @@ class EdgeLineGPT256RelDualRef(nn.Module):
             if local_img is None:
                 B, _, H, W = local_line.shape
                 local_img = torch.zeros((B, 3, H, W), device=local_line.device, dtype=local_line.dtype)
+            if local_line is None:
+                local_line = torch.zeros_like(local_img[:, :1, :, :])
             if local_mask is None:
                 local_mask = torch.zeros_like(local_line)
             l_feat = self._encode(local_img, local_line, masks=local_mask)
@@ -209,29 +213,27 @@ class EdgeLineGPT256RelDualRef(nn.Module):
         final_ref = torch.cat(ref_list, dim=1).permute(0, 2, 1).unsqueeze(-1)
         return final_ref
 
-    def forward_with_logits(self, img_idx, edge_or_line_idx, line_idx=None, masks=None, ref_feat=None):
-        if line_idx is None:
-            line_idx = edge_or_line_idx
+    def forward_with_logits(self, img_idx, line_idx, masks=None, ref_feat=None):
+        if masks is None:
+            masks = torch.zeros_like(line_idx)
         x = self._encode(img_idx, line_idx, masks)
         for block in self.blocks:
             x = block(x, ref_feat=ref_feat)
         line = self._decode(x)
         return line
 
-    def forward(self, img_idx, edge_or_line_idx, line_idx=None, edge_targets=None, line_targets=None, masks=None,
-                global_img=None, global_edge=None, global_line=None,
-                local_img=None, local_edge=None, local_line=None, local_mask=None):
-        if line_idx is None:
-            line_idx = edge_or_line_idx
-        if line_targets is None:
-            line_targets = line_idx
+    def forward(self, img_idx, line_idx, edge_targets=None, line_targets=None, masks=None,
+                global_img=None, global_line=None,
+                local_img=None, local_line=None, local_mask=None):
         ref_feat = None
+        if masks is None:
+            masks = torch.zeros_like(line_idx)
         if self.use_ref_kv:
             ref_feat = self.extract_reference_features(
                 global_img=global_img, global_line=global_line,
                 local_img=local_img, local_line=local_line, local_mask=local_mask,
             )
-        line = self.forward_with_logits(img_idx, line_idx, masks=masks, ref_feat=ref_feat)
+        edge, line = self.forward_with_logits(img_idx, line_idx, masks=masks, ref_feat=ref_feat)
         loss = 0
         if line_targets is not None:
             loss = F.binary_cross_entropy_with_logits(

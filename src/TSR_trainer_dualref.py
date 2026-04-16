@@ -1,6 +1,7 @@
 import math
 import os
 import time
+import importlib
 
 import cv2
 import numpy as np
@@ -10,10 +11,30 @@ from torch.utils.data.dataloader import DataLoader
 from torch.utils.data.distributed import DistributedSampler
 from tqdm import tqdm
 
-try:
-    from apex import amp
-except ImportError:
-    raise ImportError("Please install apex from https://www.github.com/nvidia/apex to run this example.")
+
+def resolve_amp_backend(enable_amp):
+    """
+    Return mixed-precision backend.
+    Prefer NVIDIA apex.amp when available, otherwise fallback to torch AMP.
+    """
+    backend = {'enabled': bool(enable_amp), 'name': 'fp32', 'apex_amp': None}
+    if not enable_amp:
+        return backend
+
+    apex_module = None
+    try:
+        apex_module = importlib.import_module('apex')
+    except ImportError:
+        apex_module = None
+
+    apex_amp = getattr(apex_module, 'amp', None) if apex_module is not None else None
+    if apex_amp is not None:
+        backend['name'] = 'apex'
+        backend['apex_amp'] = apex_amp
+        return backend
+
+    backend['name'] = 'torch'
+    return backend
 
 
 class EdgeAccuracy(torch.nn.Module):
@@ -111,9 +132,17 @@ class TrainerForContinuousEdgeLine:
         model, config = self.model, self.config
         raw_model = model.module if hasattr(self.model, "module") else model
         optimizer = raw_model.configure_optimizers(config)
+        amp_backend = resolve_amp_backend(self.config.AMP)
+        scaler = torch.amp.GradScaler(device='cuda', enabled=(amp_backend['name'] == 'torch'))
+        use_torch_amp = amp_backend['name'] == 'torch'
 
-        if self.config.AMP:  ## use AMP
-            model, optimizer = amp.initialize(model, optimizer, num_losses=1, opt_level='O1')
+        if self.config.AMP and amp_backend['name'] == 'apex':  ## use Apex AMP
+            model, optimizer = amp_backend['apex_amp'].initialize(model, optimizer, num_losses=1, opt_level='O1')
+            if self.global_rank == 0:
+                self.logger.info("AMP backend: NVIDIA apex.amp")
+        elif self.config.AMP and amp_backend['name'] == 'torch':
+            if self.global_rank == 0:
+                self.logger.info("AMP backend: torch.amp (fallback, apex.amp not found)")
 
         previous_epoch = -1
         bestAverageF1 = 0
@@ -160,23 +189,34 @@ class TrainerForContinuousEdgeLine:
                     if type(items[k]) is torch.Tensor:
                         items[k] = items[k].to(self.device)
 
-                line, loss = model(items['img'], items['line'], line_targets=items['line'], masks=items['mask'],
-                                         global_img=items['g_img'], global_line=items['g_line'],
-                                         local_img=items['l_img'], local_line=items['l_line'],
-                                         local_mask=items['l_mask'])
+                with torch.amp.autocast(device_type='cuda', enabled=use_torch_amp):
+                    edge, line, loss = model(items['img'], items['line'],
+                                             edge_targets=items['edge'], line_targets=items['line'],
+                                             masks=items['mask'],
+                                             global_img=items['g_img'], global_line=items['g_line'],
+                                             local_img=items['l_img'], local_line=items['l_line'],
+                                             local_mask=items['l_mask'])
                 loss = loss.mean()  # collapse all losses if they are scattered on multiple gpus
                 losses.append(loss.item())
                 # backprop and update the parameters
                 self.iterations += 1  # number of iterations processed this step (i.e. label is not -100)
                 model.zero_grad()
-                if self.config.AMP:
-                    with amp.scale_loss(loss, optimizer, loss_id=0) as loss_scaled:
+                if self.config.AMP and amp_backend['name'] == 'apex':
+                    with amp_backend['apex_amp'].scale_loss(loss, optimizer, loss_id=0) as loss_scaled:
                         loss_scaled.backward()
-                    torch.nn.utils.clip_grad_norm_(amp.master_params(optimizer), config.grad_norm_clip)
+                    torch.nn.utils.clip_grad_norm_(
+                        amp_backend['apex_amp'].master_params(optimizer), config.grad_norm_clip)
+                    optimizer.step()
+                elif self.config.AMP and use_torch_amp:
+                    scaler.scale(loss).backward()
+                    scaler.unscale_(optimizer)
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), config.grad_norm_clip)
+                    scaler.step(optimizer)
+                    scaler.update()
                 else:
                     loss.backward()
                     torch.nn.utils.clip_grad_norm_(model.parameters(), config.grad_norm_clip)
-                optimizer.step()
+                    optimizer.step()
                 # decay the learning rate based on our progress
                 if config.lr_decay:
                     if self.iterations < config.warmup_iterations:
@@ -252,7 +292,7 @@ class TrainerForContinuousEdgeLine:
                 if type(items[k]) is torch.Tensor:
                     items[k] = items[k].to(self.device)
             with torch.no_grad():
-                line, _ = model(items['img'], items['line'], masks=items['mask'],
+                edge, line, _ = model(items['img'], items['line'], masks=items['mask'],
                                      global_img=items['g_img'], global_line=items['g_line'],
                                      local_img=items['l_img'], local_line=items['l_line'],
                                      local_mask=items['l_mask'])
@@ -274,9 +314,17 @@ class TrainerForEdgeLineFinetune(TrainerForContinuousEdgeLine):
         model, config = self.model, self.config
         raw_model = model.module if hasattr(self.model, "module") else model
         optimizer = raw_model.configure_optimizers(config)
+        amp_backend = resolve_amp_backend(self.config.AMP)
+        scaler = torch.amp.GradScaler(device='cuda', enabled=(amp_backend['name'] == 'torch'))
+        use_torch_amp = amp_backend['name'] == 'torch'
 
-        if self.config.AMP:  # use AMP
-            model, optimizer = amp.initialize(model, optimizer, num_losses=1, opt_level='O1')
+        if self.config.AMP and amp_backend['name'] == 'apex':  # use Apex AMP
+            model, optimizer = amp_backend['apex_amp'].initialize(model, optimizer, num_losses=1, opt_level='O1')
+            if self.global_rank == 0:
+                self.logger.info("AMP backend: NVIDIA apex.amp")
+        elif self.config.AMP and amp_backend['name'] == 'torch':
+            if self.global_rank == 0:
+                self.logger.info("AMP backend: torch.amp (fallback, apex.amp not found)")
 
         previous_epoch = -1
         bestAverageF1 = 0
@@ -326,24 +374,35 @@ class TrainerForEdgeLineFinetune(TrainerForContinuousEdgeLine):
                     if type(items[k]) is torch.Tensor:
                         items[k] = items[k].to(self.device)
 
-                line, loss = model(items['mask_img'], items['line'], line_targets=items['line'], masks=items['erode_mask'],
-                                         global_img=items['g_img'], global_line=items['g_line'],
-                                         local_img=items['l_img'], local_line=items['l_line'],
-                                         local_mask=items['l_mask'])
+                with torch.amp.autocast(device_type='cuda', enabled=use_torch_amp):
+                    edge, line, loss = model(items['mask_img'], items['line'],
+                                             edge_targets=items['edge'], line_targets=items['line'],
+                                             masks=items['erode_mask'],
+                                             global_img=items['g_img'], global_line=items['g_line'],
+                                             local_img=items['l_img'], local_line=items['l_line'],
+                                             local_mask=items['l_mask'])
                 loss = loss.mean()  # collapse all losses if they are scattered on multiple gpus
                 losses.append(loss.item())
 
                 # backprop and update the parameters
                 self.iterations += 1  # number of iterations processed this step (i.e. label is not -100)
                 model.zero_grad()
-                if self.config.AMP:
-                    with amp.scale_loss(loss, optimizer, loss_id=0) as loss_scaled:
+                if self.config.AMP and amp_backend['name'] == 'apex':
+                    with amp_backend['apex_amp'].scale_loss(loss, optimizer, loss_id=0) as loss_scaled:
                         loss_scaled.backward()
-                    torch.nn.utils.clip_grad_norm_(amp.master_params(optimizer), config.grad_norm_clip)
+                    torch.nn.utils.clip_grad_norm_(
+                        amp_backend['apex_amp'].master_params(optimizer), config.grad_norm_clip)
+                    optimizer.step()
+                elif self.config.AMP and use_torch_amp:
+                    scaler.scale(loss).backward()
+                    scaler.unscale_(optimizer)
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), config.grad_norm_clip)
+                    scaler.step(optimizer)
+                    scaler.update()
                 else:
                     loss.backward()
                     torch.nn.utils.clip_grad_norm_(model.parameters(), config.grad_norm_clip)
-                optimizer.step()
+                    optimizer.step()
                 # decay the learning rate based on our progress
                 if config.lr_decay:
                     if self.iterations < config.warmup_iterations:
@@ -419,7 +478,7 @@ class TrainerForEdgeLineFinetune(TrainerForContinuousEdgeLine):
                 if type(items[k]) is torch.Tensor:
                     items[k] = items[k].to(self.device)
             with torch.no_grad():
-                line, _ = model(items['mask_img'], items['line'], masks=items['erode_mask'],
+                edge, line, _ = model(items['mask_img'], items['line'], masks=items['erode_mask'],
                                      global_img=items['g_img'], global_line=items['g_line'],
                                      local_img=items['l_img'], local_line=items['l_line'],
                                      local_mask=items['l_mask'])

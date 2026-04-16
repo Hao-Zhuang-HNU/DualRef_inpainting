@@ -277,7 +277,6 @@ def SampleEdgeLineLogits(model, context, mask=None, iterations=1, device='cuda',
     with torch.no_grad():
         for i in range(iterations):
             edge_logits, line_logits = model.forward_with_logits(img.float(),
-                                                                 edge.float(),
                                                                  line.float(),
                                                                  masks=mask.float())
             edge_pred = torch.sigmoid(edge_logits)
