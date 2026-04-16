@@ -56,33 +56,27 @@ class ContinuousEdgeLineDatasetMaskFinetuneDualRef(Dataset):
 
         if self.no_global_ref:
             g_img = torch.zeros_like(curr['img'])
-            g_edge = torch.zeros_like(curr['edge'])
             g_line = torch.zeros_like(curr['line'])
         else:
             g_item = self.dataset[info['global_idx']]
             g_img = g_item['img']
-            g_edge = g_item['edge']
             g_line = g_item['line']
 
         if self.no_local_ref or info['is_first']:
             l_img = torch.zeros_like(curr['img'])
-            l_edge = torch.zeros_like(curr['edge'])
             l_line = torch.zeros_like(curr['line'])
             l_mask = torch.ones_like(curr['mask'])
         else:
             l_item = self.dataset[info['prev_idx']]
             l_img = l_item['img']
-            l_edge = l_item['edge']
             l_line = l_item['line']
             l_mask = torch.zeros_like(curr['mask'])
 
         out = dict(curr)
         out.update({
             'g_img': g_img.contiguous(),
-            'g_edge': g_edge.contiguous(),
             'g_line': g_line.contiguous(),
             'l_img': l_img.contiguous(),
-            'l_edge': l_edge.contiguous(),
             'l_line': l_line.contiguous(),
             'l_mask': l_mask.contiguous(),
             'is_first': torch.tensor(1.0 if info['is_first'] else 0.0, dtype=torch.float32),
