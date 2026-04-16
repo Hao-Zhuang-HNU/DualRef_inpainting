@@ -265,40 +265,30 @@ class Progbar(object):
 
 # progressiveley sampling edge line
 def SampleEdgeLineLogits(model, context, mask=None, iterations=1, device='cuda', add_v=0, mul_v=4):
-    [img, edge, line] = context
+    [img, line] = context
     img = img.to(device)
-    edge = edge.to(device)
     line = line.to(device)
     mask = mask.to(device)
     img = img * (1 - mask)
-    edge = edge * (1 - mask)
     line = line * (1 - mask)
     model.eval()
     with torch.no_grad():
         for i in range(iterations):
-            edge_logits, line_logits = model.forward_with_logits(img.float(),
-                                                                 line.float(),
-                                                                 masks=mask.float())
-            edge_pred = torch.sigmoid(edge_logits)
+            line_logits = model.forward_with_logits(img.float(),
+                                                    line.float(),
+                                                    masks=mask.float())
             line_pred = torch.sigmoid((line_logits + add_v) * mul_v)
-            edge = edge + edge_pred * mask
-            edge[edge >= 0.25] = 1
-            edge[edge < 0.25] = 0
             line = line + line_pred * mask
 
-            b, _, h, w = edge_pred.shape
-            edge_pred = edge_pred.reshape(b, -1, 1)
+            b, _, h, w = line_pred.shape
             line_pred = line_pred.reshape(b, -1, 1)
             mask = mask.reshape(b, -1)
 
-            edge_probs = torch.cat([1 - edge_pred, edge_pred], dim=-1)
             line_probs = torch.cat([1 - line_pred, line_pred], dim=-1)
-            edge_probs[:, :, 1] += 0.5
             line_probs[:, :, 1] += 0.5
-            edge_max_probs = edge_probs.max(dim=-1)[0] + (1 - mask) * (-100)
             line_max_probs = line_probs.max(dim=-1)[0] + (1 - mask) * (-100)
 
-            indices = torch.sort(edge_max_probs + line_max_probs, dim=-1, descending=True)[1]
+            indices = torch.sort(line_max_probs, dim=-1, descending=True)[1]
 
             for ii in range(b):
                 keep = int((i + 1) / iterations * torch.sum(mask[ii, ...]))
@@ -307,10 +297,9 @@ def SampleEdgeLineLogits(model, context, mask=None, iterations=1, device='cuda',
                 mask[ii][indices[ii, :keep]] = 0
 
             mask = mask.reshape(b, 1, h, w)
-            edge = edge * (1 - mask)
             line = line * (1 - mask)
 
-        return edge, line
+        return line
 
 
 def get_lr_schedule_with_warmup(optimizer, num_warmup_steps, milestone_step, gamma, last_epoch=-1):

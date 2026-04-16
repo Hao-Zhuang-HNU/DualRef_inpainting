@@ -190,8 +190,8 @@ class TrainerForContinuousEdgeLine:
                         items[k] = items[k].to(self.device)
 
                 with torch.amp.autocast(device_type='cuda', enabled=use_torch_amp):
-                    edge, line, loss = model(items['img'], items['line'],
-                                             edge_targets=items['edge'], line_targets=items['line'],
+                    line, loss = model(items['img'], items['line'],
+                                             line_targets=items['line'],
                                              masks=items['mask'],
                                              global_img=items['g_img'], global_line=items['g_line'],
                                              local_img=items['l_img'], local_line=items['l_line'],
@@ -292,7 +292,7 @@ class TrainerForContinuousEdgeLine:
                 if type(items[k]) is torch.Tensor:
                     items[k] = items[k].to(self.device)
             with torch.no_grad():
-                edge, line, _ = model(items['img'], items['line'], masks=items['mask'],
+                line, _ = model(items['img'], items['line'], masks=items['mask'],
                                      global_img=items['g_img'], global_line=items['g_line'],
                                      local_img=items['l_img'], local_line=items['l_line'],
                                      local_mask=items['l_mask'])
@@ -375,8 +375,8 @@ class TrainerForEdgeLineFinetune(TrainerForContinuousEdgeLine):
                         items[k] = items[k].to(self.device)
 
                 with torch.amp.autocast(device_type='cuda', enabled=use_torch_amp):
-                    edge, line, loss = model(items['mask_img'], items['line'],
-                                             edge_targets=items['edge'], line_targets=items['line'],
+                    line, loss = model(items['mask_img'], items['line'],
+                                             line_targets=items['line'],
                                              masks=items['erode_mask'],
                                              global_img=items['g_img'], global_line=items['g_line'],
                                              local_img=items['l_img'], local_line=items['l_line'],
@@ -478,7 +478,7 @@ class TrainerForEdgeLineFinetune(TrainerForContinuousEdgeLine):
                 if type(items[k]) is torch.Tensor:
                     items[k] = items[k].to(self.device)
             with torch.no_grad():
-                edge, line, _ = model(items['mask_img'], items['line'], masks=items['erode_mask'],
+                line, _ = model(items['mask_img'], items['line'], masks=items['erode_mask'],
                                      global_img=items['g_img'], global_line=items['g_line'],
                                      local_img=items['l_img'], local_line=items['l_line'],
                                      local_mask=items['l_mask'])
