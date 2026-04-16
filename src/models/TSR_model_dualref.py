@@ -129,26 +129,43 @@ class EdgeLineGPT256RelDualRef(nn.Module):
             module.weight.data.fill_(1.0)
 
     def configure_optimizers(self, train_config):
-        param_dict = {pn: p for pn, p in self.named_parameters() if p.requires_grad}
-        explicit_no_decay = {'pos_emb', 'type_emb_global', 'type_emb_local'}
-        decay_params, no_decay_params = [], []
-        decay_names, no_decay_names = [], []
-
-        for pn, p in param_dict.items():
-            if (pn in explicit_no_decay
-                    or pn.endswith('bias')
-                    or pn.endswith('row_rel_emb')
-                    or pn.endswith('col_rel_emb')
-                    or p.ndim < 2):
-                no_decay_params.append(p)
-                no_decay_names.append(pn)
-            else:
-                decay_params.append(p)
-                decay_names.append(pn)
-
-        if len(decay_params) == 0:
-            logger.warning("No decay parameters detected; all params are assigned to no_decay.")
-
+        decay = set()
+        no_decay = set()
+        whitelist_weight_modules = (torch.nn.Linear, torch.nn.Conv2d, torch.nn.ConvTranspose2d)
+        blacklist_weight_modules = (torch.nn.LayerNorm, torch.nn.Embedding)
+        for mn, m in self.named_modules():
+            for pn, _ in m.named_parameters(recurse=False):
+                fpn = '%s.%s' % (mn, pn) if mn else pn
+                if pn.endswith('bias'):
+                    no_decay.add(fpn)
+                elif pn.endswith('weight') and isinstance(m, whitelist_weight_modules):
+                    decay.add(fpn)
+                elif pn.endswith('weight') and isinstance(m, blacklist_weight_modules):
+                    no_decay.add(fpn)
+                elif pn in {'row_rel_emb', 'col_rel_emb'}:
+                    no_decay.add(fpn)
+        no_decay.update({'pos_emb', 'type_emb_global', 'type_emb_local'})
+        param_dict = {pn: p for pn, p in self.named_parameters()}
+        all_params = set(param_dict.keys())
+        inter_params = decay & no_decay
+        if len(inter_params) > 0:
+            logger.warning("Found params in both decay/no_decay, keeping them in no_decay: %s",
+                           sorted(inter_params))
+            decay = decay - inter_params
+        unassigned_params = all_params - decay - no_decay
+        if len(unassigned_params) > 0:
+            logger.warning("Found unassigned params in optimizer grouping, fallback to no_decay: %s",
+                           sorted(unassigned_params))
+            no_decay.update(unassigned_params)
+        union_params = decay | no_decay
+        unassigned_params = param_dict.keys() - union_params
+        if len(unassigned_params) > 0:
+            logger.warning("Found unassigned params in optimizer grouping, fallback to no_decay: %s",
+                           sorted(unassigned_params))
+            no_decay.update(unassigned_params)
+            union_params = decay | no_decay
+        assert len(inter_params) == 0, f"params in both decay/no_decay: {inter_params}"
+        assert len(all_params - union_params) == 0, f"params not separated: {all_params - union_params}"
         optim_groups = [
             {"params": decay_params, "weight_decay": train_config.weight_decay},
             {"params": no_decay_params, "weight_decay": 0.0},
