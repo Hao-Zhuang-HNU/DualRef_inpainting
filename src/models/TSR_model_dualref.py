@@ -77,7 +77,7 @@ class EdgeLineGPT256RelDualRef(nn.Module):
     def __init__(self, config):
         super().__init__()
         self.pad1 = nn.ReflectionPad2d(3)
-        self.conv1 = nn.Conv2d(in_channels=6, out_channels=64, kernel_size=7, padding=0)
+        self.conv1 = nn.Conv2d(in_channels=5, out_channels=64, kernel_size=7, padding=0)
         self.act = nn.ReLU(True)
         self.conv2 = nn.Conv2d(in_channels=64, out_channels=128, kernel_size=4, stride=2, padding=1)
         self.conv3 = nn.Conv2d(in_channels=128, out_channels=256, kernel_size=4, stride=2, padding=1)
@@ -102,16 +102,6 @@ class EdgeLineGPT256RelDualRef(nn.Module):
         self.config = config
         self.use_ref_kv = getattr(config, 'use_ref_kv', True)
 
-        self.edge_decoder = nn.Sequential(
-            nn.ConvTranspose2d(256, 256, kernel_size=4, stride=2, padding=1),
-            nn.ReLU(True),
-            nn.ConvTranspose2d(256, 128, kernel_size=4, stride=2, padding=1),
-            nn.ReLU(True),
-            nn.ConvTranspose2d(128, 64, kernel_size=4, stride=2, padding=1),
-            nn.ReLU(True),
-            nn.ReflectionPad2d(3),
-            nn.Conv2d(64, 1, kernel_size=7, padding=0),
-        )
         self.line_decoder = nn.Sequential(
             nn.ConvTranspose2d(256, 256, kernel_size=4, stride=2, padding=1),
             nn.ReLU(True),
@@ -164,11 +154,10 @@ class EdgeLineGPT256RelDualRef(nn.Module):
         ]
         return torch.optim.AdamW(optim_groups, lr=train_config.learning_rate, betas=train_config.betas)
 
-    def _encode(self, img_idx, edge_idx, line_idx, masks):
+    def _encode(self, img_idx, line_idx, masks):
         img_idx = img_idx * (1 - masks)
-        edge_idx = edge_idx * (1 - masks)
         line_idx = line_idx * (1 - masks)
-        x = torch.cat((img_idx, edge_idx, line_idx, masks), dim=1)
+        x = torch.cat((img_idx, line_idx, masks), dim=1)
         x = self.pad1(x)
         x = self.conv1(x)
         x = self.act(x)
@@ -187,30 +176,29 @@ class EdgeLineGPT256RelDualRef(nn.Module):
 
     def _decode(self, x):
         x = self.ln_f(x.permute(0, 2, 3, 1)).permute(0, 3, 1, 2).contiguous()
-        edge = self.edge_decoder(x)
         line = self.line_decoder(x)
-        return edge, line
+        return line
 
     def extract_reference_features(self,
-                                   global_img=None, global_edge=None, global_line=None,
-                                   local_img=None, local_edge=None, local_line=None, local_mask=None):
+                                   global_img=None, global_line=None,
+                                   local_img=None, local_line=None, local_mask=None):
         ref_list = []
-        if global_img is not None or global_edge is not None:
+        if global_img is not None or global_line is not None:
             if global_img is None:
-                B, _, H, W = global_edge.shape
-                global_img = torch.zeros((B, 3, H, W), device=global_edge.device, dtype=global_edge.dtype)
+                B, _, H, W = global_line.shape
+                global_img = torch.zeros((B, 3, H, W), device=global_line.device, dtype=global_line.dtype)
             zero_mask = torch.zeros_like(global_img[:, :1, :, :])
-            g_feat = self._encode(global_img, global_edge, global_line, masks=zero_mask)
+            g_feat = self._encode(global_img, global_line, masks=zero_mask)
             g_feat = F.adaptive_avg_pool2d(g_feat, (self.config.global_pool_size, self.config.global_pool_size))
             g_feat = g_feat.flatten(2).transpose(1, 2) + self.type_emb_global
             ref_list.append(g_feat)
-        if local_img is not None or local_edge is not None:
+        if local_img is not None or local_line is not None:
             if local_img is None:
-                B, _, H, W = local_edge.shape
-                local_img = torch.zeros((B, 3, H, W), device=local_edge.device, dtype=local_edge.dtype)
+                B, _, H, W = local_line.shape
+                local_img = torch.zeros((B, 3, H, W), device=local_line.device, dtype=local_line.dtype)
             if local_mask is None:
-                local_mask = torch.zeros_like(local_edge)
-            l_feat = self._encode(local_img, local_edge, local_line, masks=local_mask)
+                local_mask = torch.zeros_like(local_line)
+            l_feat = self._encode(local_img, local_line, masks=local_mask)
             l_feat = self.ref_refinement(l_feat)
             if getattr(self.config, 'local_pool_size', 32) != 32:
                 l_feat = F.adaptive_avg_pool2d(l_feat, (self.config.local_pool_size, self.config.local_pool_size))
@@ -221,35 +209,36 @@ class EdgeLineGPT256RelDualRef(nn.Module):
         final_ref = torch.cat(ref_list, dim=1).permute(0, 2, 1).unsqueeze(-1)
         return final_ref
 
-    def forward_with_logits(self, img_idx, edge_idx, line_idx, masks=None, ref_feat=None):
-        x = self._encode(img_idx, edge_idx, line_idx, masks)
+    def forward_with_logits(self, img_idx, edge_or_line_idx, line_idx=None, masks=None, ref_feat=None):
+        if line_idx is None:
+            line_idx = edge_or_line_idx
+        x = self._encode(img_idx, line_idx, masks)
         for block in self.blocks:
             x = block(x, ref_feat=ref_feat)
-        edge, line = self._decode(x)
-        return edge, line
+        line = self._decode(x)
+        return line
 
-    def forward(self, img_idx, edge_idx, line_idx, edge_targets=None, line_targets=None, masks=None,
+    def forward(self, img_idx, edge_or_line_idx, line_idx=None, edge_targets=None, line_targets=None, masks=None,
                 global_img=None, global_edge=None, global_line=None,
                 local_img=None, local_edge=None, local_line=None, local_mask=None):
+        if line_idx is None:
+            line_idx = edge_or_line_idx
+        if line_targets is None:
+            line_targets = line_idx
         ref_feat = None
         if self.use_ref_kv:
             ref_feat = self.extract_reference_features(
-                global_img=global_img, global_edge=global_edge, global_line=global_line,
-                local_img=local_img, local_edge=local_edge, local_line=local_line, local_mask=local_mask,
+                global_img=global_img, global_line=global_line,
+                local_img=local_img, local_line=local_line, local_mask=local_mask,
             )
-        edge, line = self.forward_with_logits(img_idx, edge_idx, line_idx, masks=masks, ref_feat=ref_feat)
+        line = self.forward_with_logits(img_idx, line_idx, masks=masks, ref_feat=ref_feat)
         loss = 0
-        if edge_targets is not None and line_targets is not None:
+        if line_targets is not None:
             loss = F.binary_cross_entropy_with_logits(
-                edge.permute(0, 2, 3, 1).contiguous().view(-1, 1),
-                edge_targets.permute(0, 2, 3, 1).contiguous().view(-1, 1),
-                reduction='none'
-            )
-            loss = loss + F.binary_cross_entropy_with_logits(
                 line.permute(0, 2, 3, 1).contiguous().view(-1, 1),
                 line_targets.permute(0, 2, 3, 1).contiguous().view(-1, 1),
                 reduction='none'
             )
             loss = (loss * masks.view(-1, 1)).mean()
-        edge, line = self.act_last(edge), self.act_last(line)
-        return edge, line, loss
+        line = self.act_last(line)
+        return line, loss
