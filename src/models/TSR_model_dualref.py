@@ -154,6 +154,12 @@ class EdgeLineGPT256RelDualRef(nn.Module):
                     no_decay.add(fpn)
         no_decay.update({'pos_emb', 'type_emb_global', 'type_emb_local'})
         param_dict = {pn: p for pn, p in self.named_parameters()}
+        # Parameters such as axial relative position embeddings (e.g. row_rel_emb/col_rel_emb)
+        # are standalone nn.Parameter tensors (not "*.weight"/"*.bias"), so place them in
+        # no_decay by default instead of failing the optimizer split assertion.
+        for pn in param_dict.keys():
+            if pn not in decay and pn not in no_decay:
+                no_decay.add(pn)
         inter_params = decay & no_decay
         union_params = decay | no_decay
         assert len(inter_params) == 0, f"params in both decay/no_decay: {inter_params}"
