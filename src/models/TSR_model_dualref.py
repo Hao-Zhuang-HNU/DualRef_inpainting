@@ -158,7 +158,12 @@ class EdgeLineGPT256RelDualRef(nn.Module):
                            sorted(unassigned_params))
             no_decay.update(unassigned_params)
         union_params = decay | no_decay
-        inter_params = decay & no_decay
+        unassigned_params = param_dict.keys() - union_params
+        if len(unassigned_params) > 0:
+            logger.warning("Found unassigned params in optimizer grouping, fallback to no_decay: %s",
+                           sorted(unassigned_params))
+            no_decay.update(unassigned_params)
+            union_params = decay | no_decay
         assert len(inter_params) == 0, f"params in both decay/no_decay: {inter_params}"
         assert len(all_params - union_params) == 0, f"params not separated: {all_params - union_params}"
         optim_groups = [
