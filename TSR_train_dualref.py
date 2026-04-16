@@ -52,7 +52,8 @@ def main_worker(rank, opts):
                                  final_iterations=train_epochs * iterations_per_epoch / opts.world_size,
                                  ckpt_path=opts.ckpt_path, num_workers=12, GPU_ids=opts.GPU_ids,
                                  world_size=opts.world_size,
-                                 AMP=opts.AMP, print_freq=opts.print_freq)
+                                 AMP=opts.AMP, amp_opt_level=opts.amp_opt_level,
+                                 print_freq=opts.print_freq)
 
     trainer = TrainerForEdgeLineFinetune(IGPT_model, train_dataset, test_dataset, train_config, gpu, rank,
                                              iterations_per_epoch, logger=logger)
@@ -92,6 +93,8 @@ if __name__ == '__main__':
     parser.add_argument('--nodes', type=int, default=1, help='how many machines')
     parser.add_argument('--gpus', type=int, default=1, help='how many GPUs in one node')
     parser.add_argument('--AMP', action='store_true', help='Automatic Mixed Precision')
+    parser.add_argument('--amp_opt_level', type=str, default='O1', choices=['O0', 'O1', 'O2', 'O3'],
+                        help='Apex AMP optimization level when --AMP is enabled')
     parser.add_argument('--local_rank', type=int, default=-1, help='the id of this machine')
 
     opts = parser.parse_args()

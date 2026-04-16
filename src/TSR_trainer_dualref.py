@@ -58,6 +58,7 @@ class TrainerConfig:
     # checkpoint settings
     ckpt_path = None
     num_workers = 0  # for DataLoader
+    amp_opt_level = 'O1'
 
     def __init__(self, **kwargs):
         for k, v in kwargs.items():
@@ -113,7 +114,7 @@ class TrainerForContinuousEdgeLine:
         optimizer = raw_model.configure_optimizers(config)
 
         if self.config.AMP:  ## use AMP
-            model, optimizer = amp.initialize(model, optimizer, num_losses=1, opt_level='O1')
+            model, optimizer = amp.initialize(model, optimizer, opt_level=config.amp_opt_level)
 
         previous_epoch = -1
         bestAverageF1 = 0
@@ -171,7 +172,7 @@ class TrainerForContinuousEdgeLine:
                 self.iterations += 1  # number of iterations processed this step (i.e. label is not -100)
                 model.zero_grad()
                 if self.config.AMP:
-                    with amp.scale_loss(loss, optimizer, loss_id=0) as loss_scaled:
+                    with amp.scale_loss(loss, optimizer) as loss_scaled:
                         loss_scaled.backward()
                     torch.nn.utils.clip_grad_norm_(amp.master_params(optimizer), config.grad_norm_clip)
                 else:
@@ -294,7 +295,7 @@ class TrainerForEdgeLineFinetune(TrainerForContinuousEdgeLine):
         optimizer = raw_model.configure_optimizers(config)
 
         if self.config.AMP:  # use AMP
-            model, optimizer = amp.initialize(model, optimizer, num_losses=1, opt_level='O1')
+            model, optimizer = amp.initialize(model, optimizer, opt_level=config.amp_opt_level)
 
         previous_epoch = -1
         bestAverageF1 = 0
@@ -356,7 +357,7 @@ class TrainerForEdgeLineFinetune(TrainerForContinuousEdgeLine):
                 self.iterations += 1  # number of iterations processed this step (i.e. label is not -100)
                 model.zero_grad()
                 if self.config.AMP:
-                    with amp.scale_loss(loss, optimizer, loss_id=0) as loss_scaled:
+                    with amp.scale_loss(loss, optimizer) as loss_scaled:
                         loss_scaled.backward()
                     torch.nn.utils.clip_grad_norm_(amp.master_params(optimizer), config.grad_norm_clip)
                 else:
