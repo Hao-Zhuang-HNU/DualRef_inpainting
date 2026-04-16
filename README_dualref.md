@@ -47,3 +47,7 @@ python TSR_train_dualref.py \
 - `--no_global_ref`: disable the first-frame reference stream
 - `--no_local_ref`: disable the previous-frame reference stream
 
+## Branch policy
+
+- The `edge` branch has been retired and is no longer maintained.
+- Please use the `work` branch (or new feature branches created from it) for all future development.
