@@ -146,7 +146,17 @@ class EdgeLineGPT256RelDualRef(nn.Module):
                     no_decay.add(fpn)
         no_decay.update({'pos_emb', 'type_emb_global', 'type_emb_local'})
         param_dict = {pn: p for pn, p in self.named_parameters()}
+        all_params = set(param_dict.keys())
         inter_params = decay & no_decay
+        if len(inter_params) > 0:
+            logger.warning("Found params in both decay/no_decay, keeping them in no_decay: %s",
+                           sorted(inter_params))
+            decay = decay - inter_params
+        unassigned_params = all_params - decay - no_decay
+        if len(unassigned_params) > 0:
+            logger.warning("Found unassigned params in optimizer grouping, fallback to no_decay: %s",
+                           sorted(unassigned_params))
+            no_decay.update(unassigned_params)
         union_params = decay | no_decay
         unassigned_params = param_dict.keys() - union_params
         if len(unassigned_params) > 0:
@@ -155,7 +165,7 @@ class EdgeLineGPT256RelDualRef(nn.Module):
             no_decay.update(unassigned_params)
             union_params = decay | no_decay
         assert len(inter_params) == 0, f"params in both decay/no_decay: {inter_params}"
-        assert len(param_dict.keys() - union_params) == 0, f"params not separated: {param_dict.keys() - union_params}"
+        assert len(all_params - union_params) == 0, f"params not separated: {all_params - union_params}"
         optim_groups = [
             {"params": [param_dict[pn] for pn in sorted(list(decay))], "weight_decay": train_config.weight_decay},
             {"params": [param_dict[pn] for pn in sorted(list(no_decay))], "weight_decay": 0.0},
