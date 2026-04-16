@@ -142,6 +142,8 @@ class EdgeLineGPT256RelDualRef(nn.Module):
                     decay.add(fpn)
                 elif pn.endswith('weight') and isinstance(m, blacklist_weight_modules):
                     no_decay.add(fpn)
+                elif pn in {'row_rel_emb', 'col_rel_emb'}:
+                    no_decay.add(fpn)
         no_decay.update({'pos_emb', 'type_emb_global', 'type_emb_local'})
         param_dict = {pn: p for pn, p in self.named_parameters()}
         inter_params = decay & no_decay
@@ -222,7 +224,7 @@ class EdgeLineGPT256RelDualRef(nn.Module):
         line = self._decode(x)
         return line
 
-    def forward(self, img_idx, line_idx, edge_targets=None, line_targets=None, masks=None,
+    def forward(self, img_idx, line_idx, line_targets=None, masks=None,
                 global_img=None, global_line=None,
                 local_img=None, local_line=None, local_mask=None):
         ref_feat = None
@@ -233,7 +235,7 @@ class EdgeLineGPT256RelDualRef(nn.Module):
                 global_img=global_img, global_line=global_line,
                 local_img=local_img, local_line=local_line, local_mask=local_mask,
             )
-        edge, line = self.forward_with_logits(img_idx, line_idx, masks=masks, ref_feat=ref_feat)
+        line = self.forward_with_logits(img_idx, line_idx, masks=masks, ref_feat=ref_feat)
         loss = 0
         if line_targets is not None:
             loss = F.binary_cross_entropy_with_logits(
