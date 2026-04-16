@@ -167,9 +167,10 @@ class EdgeLineGPT256RelDualRef(nn.Module):
         assert len(inter_params) == 0, f"params in both decay/no_decay: {inter_params}"
         assert len(all_params - union_params) == 0, f"params not separated: {all_params - union_params}"
         optim_groups = [
-            {"params": [param_dict[pn] for pn in sorted(list(decay))], "weight_decay": train_config.weight_decay},
-            {"params": [param_dict[pn] for pn in sorted(list(no_decay))], "weight_decay": 0.0},
+            {"params": decay_params, "weight_decay": train_config.weight_decay},
+            {"params": no_decay_params, "weight_decay": 0.0},
         ]
+        logger.info("Optimizer groups - decay: %d, no_decay: %d", len(decay_names), len(no_decay_names))
         return torch.optim.AdamW(optim_groups, lr=train_config.learning_rate, betas=train_config.betas)
 
     def _encode(self, img_idx, line_idx, masks):
