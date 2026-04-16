@@ -129,29 +129,32 @@ class EdgeLineGPT256RelDualRef(nn.Module):
             module.weight.data.fill_(1.0)
 
     def configure_optimizers(self, train_config):
-        decay = set()
-        no_decay = set()
-        whitelist_weight_modules = (torch.nn.Linear, torch.nn.Conv2d, torch.nn.ConvTranspose2d)
-        blacklist_weight_modules = (torch.nn.LayerNorm, torch.nn.Embedding)
-        for mn, m in self.named_modules():
-            for pn, _ in m.named_parameters(recurse=False):
-                fpn = '%s.%s' % (mn, pn) if mn else pn
-                if pn.endswith('bias'):
-                    no_decay.add(fpn)
-                elif pn.endswith('weight') and isinstance(m, whitelist_weight_modules):
-                    decay.add(fpn)
-                elif pn.endswith('weight') and isinstance(m, blacklist_weight_modules):
-                    no_decay.add(fpn)
-        no_decay.update({'pos_emb', 'type_emb_global', 'type_emb_local'})
-        param_dict = {pn: p for pn, p in self.named_parameters()}
-        inter_params = decay & no_decay
-        union_params = decay | no_decay
-        assert len(inter_params) == 0, f"params in both decay/no_decay: {inter_params}"
-        assert len(param_dict.keys() - union_params) == 0, f"params not separated: {param_dict.keys() - union_params}"
+        # noEdge branch: keep optimizer grouping robust to parameter-name/module changes.
+        param_dict = {pn: p for pn, p in self.named_parameters() if p.requires_grad}
+        explicit_no_decay = {'pos_emb', 'type_emb_global', 'type_emb_local'}
+        decay_params, no_decay_params = [], []
+        decay_names, no_decay_names = [], []
+
+        for pn, p in param_dict.items():
+            if (pn in explicit_no_decay
+                    or pn.endswith('bias')
+                    or pn.endswith('row_rel_emb')
+                    or pn.endswith('col_rel_emb')
+                    or p.ndim < 2):
+                no_decay_params.append(p)
+                no_decay_names.append(pn)
+            else:
+                decay_params.append(p)
+                decay_names.append(pn)
+
+        if len(decay_params) == 0:
+            logger.warning("No decay parameters detected; all params are assigned to no_decay.")
+
         optim_groups = [
-            {"params": [param_dict[pn] for pn in sorted(list(decay))], "weight_decay": train_config.weight_decay},
-            {"params": [param_dict[pn] for pn in sorted(list(no_decay))], "weight_decay": 0.0},
+            {"params": decay_params, "weight_decay": train_config.weight_decay},
+            {"params": no_decay_params, "weight_decay": 0.0},
         ]
+        logger.info("Optimizer groups - decay: %d, no_decay: %d", len(decay_names), len(no_decay_names))
         return torch.optim.AdamW(optim_groups, lr=train_config.learning_rate, betas=train_config.betas)
 
     def _encode(self, img_idx, line_idx, masks):
@@ -222,7 +225,7 @@ class EdgeLineGPT256RelDualRef(nn.Module):
         line = self._decode(x)
         return line
 
-    def forward(self, img_idx, line_idx, edge_targets=None, line_targets=None, masks=None,
+    def forward(self, img_idx, line_idx, line_targets=None, masks=None,
                 global_img=None, global_line=None,
                 local_img=None, local_line=None, local_mask=None):
         ref_feat = None
@@ -233,7 +236,7 @@ class EdgeLineGPT256RelDualRef(nn.Module):
                 global_img=global_img, global_line=global_line,
                 local_img=local_img, local_line=local_line, local_mask=local_mask,
             )
-        edge, line = self.forward_with_logits(img_idx, line_idx, masks=masks, ref_feat=ref_feat)
+        line = self.forward_with_logits(img_idx, line_idx, masks=masks, ref_feat=ref_feat)
         loss = 0
         if line_targets is not None:
             loss = F.binary_cross_entropy_with_logits(
